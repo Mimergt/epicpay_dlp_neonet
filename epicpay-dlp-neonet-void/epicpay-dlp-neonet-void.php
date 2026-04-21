@@ -3,7 +3,7 @@
  * Plugin Name: EpicPay - DLP Neonet Void on Cancel
  * Plugin URI: https://github.com/Mimergt/epicpay_dlp_neonet
  * Description: Standalone WooCommerce plugin that attempts a payment void when an order is cancelled.
- * Version: 0.2.0
+ * Version: 0.3.0
  * Author: EpicPay
  * Author URI: https://github.com/Mimergt
  * License: GPL-2.0+
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'EPICPAY_DLP_NEONET_VOID_VERSION', '0.2.0' );
+define( 'EPICPAY_DLP_NEONET_VOID_VERSION', '0.3.0' );
 define( 'EPICPAY_DLP_NEONET_VOID_FILE', __FILE__ );
 define( 'EPICPAY_DLP_NEONET_VOID_PATH', plugin_dir_path( __FILE__ ) );
 define( 'EPICPAY_DLP_NEONET_VOID_URL', plugin_dir_url( __FILE__ ) );

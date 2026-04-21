@@ -123,6 +123,9 @@ class EpicPay_DLP_Neonet_Void_Gateway_Adapter {
 	/**
 	 * Attempt a direct Cybersource VOID request.
 	 *
+	 * Uses /voids endpoint (correct for post-capture/Charge transactions).
+	 * Falls back to /reversals only if /voids returns 404 (auth-only orders).
+	 *
 	 * @param WC_Order           $order WooCommerce order.
 	 * @param WC_Payment_Gateway $gateway Payment gateway instance.
 	 * @param string             $transaction_reference Cybersource transaction ID/reference.
@@ -139,18 +142,61 @@ class EpicPay_DLP_Neonet_Void_Gateway_Adapter {
 			);
 		}
 
-		$payload = array(
-			'clientReferenceInformation' => array(
-				'code' => (string) $order->get_order_number(),
-			),
-			'reversalInformation' => array(
-				'amountDetails' => array(
-					'totalAmount' => wc_format_decimal( $order->get_total(), wc_get_price_decimals() ),
-					'currency'    => (string) $order->get_currency(),
+		// POST /pts/v2/payments/{id}/voids — works for Charge (authorized + captured).
+		$void_result = $this->call_cybersource_api(
+			$order,
+			$credentials,
+			$transaction_reference,
+			'voids',
+			array(
+				'clientReferenceInformation' => array(
+					'code' => (string) $order->get_order_number(),
 				),
-			),
+			)
 		);
 
+		if ( ! empty( $void_result['success'] ) ) {
+			return $void_result;
+		}
+
+		// If /voids returned 404, the transaction may be auth-only (not captured yet).
+		// Retry with /reversals which is the correct endpoint for that case.
+		if ( isset( $void_result['http_status'] ) && 404 === $void_result['http_status'] ) {
+			$this->log( 'VOID 404 — retrying with /reversals for auth-only transaction', array( 'order_id' => $order->get_id() ) );
+
+			return $this->call_cybersource_api(
+				$order,
+				$credentials,
+				$transaction_reference,
+				'reversals',
+				array(
+					'clientReferenceInformation' => array(
+						'code' => (string) $order->get_order_number(),
+					),
+					'reversalInformation' => array(
+						'amountDetails' => array(
+							'totalAmount' => wc_format_decimal( $order->get_total(), wc_get_price_decimals() ),
+							'currency'    => (string) $order->get_currency(),
+						),
+					),
+				)
+			);
+		}
+
+		return $void_result;
+	}
+
+	/**
+	 * Sign and execute a Cybersource REST API POST request.
+	 *
+	 * @param WC_Order $order      WooCommerce order (for logging).
+	 * @param array    $credentials Resolved credentials.
+	 * @param string   $transaction_reference Cybersource payment ID.
+	 * @param string   $action     API action segment: 'voids' or 'reversals'.
+	 * @param array    $payload    Request payload (will be JSON-encoded).
+	 * @return array
+	 */
+	private function call_cybersource_api( WC_Order $order, $credentials, $transaction_reference, $action, $payload ) {
 		$payload_json = wp_json_encode( $payload );
 		if ( false === $payload_json ) {
 			return array(
@@ -161,7 +207,7 @@ class EpicPay_DLP_Neonet_Void_Gateway_Adapter {
 		}
 
 		$host = 'production' === $credentials['environment'] ? 'api.cybersource.com' : 'apitest.cybersource.com';
-		$path = '/pts/v2/payments/' . rawurlencode( $transaction_reference ) . '/reversals';
+		$path = '/pts/v2/payments/' . rawurlencode( $transaction_reference ) . '/' . $action;
 		$url  = 'https://' . $host . $path;
 
 		$date_header   = gmdate( 'D, d M Y H:i:s \G\M\T' );
@@ -175,12 +221,10 @@ class EpicPay_DLP_Neonet_Void_Gateway_Adapter {
 			'digest: ' . $digest_header . "\n" .
 			'v-c-merchant-id: ' . $credentials['merchant_id'];
 
-		$hmac = hash_hmac( 'sha256', $signature_payload, base64_decode( $credentials['shared_secret'], true ), true );
-		if ( false === $hmac ) {
-			$hmac = hash_hmac( 'sha256', $signature_payload, $credentials['shared_secret'], true );
-		}
+		$decoded_secret = base64_decode( $credentials['shared_secret'], true );
+		$hmac_key       = ( false !== $decoded_secret && strlen( $decoded_secret ) > 0 ) ? $decoded_secret : $credentials['shared_secret'];
+		$signature      = base64_encode( hash_hmac( 'sha256', $signature_payload, $hmac_key, true ) );
 
-		$signature = base64_encode( $hmac );
 		$signature_header = sprintf(
 			'keyid="%s", algorithm="HmacSHA256", headers="%s", signature="%s"',
 			$credentials['key_id'],
@@ -206,7 +250,7 @@ class EpicPay_DLP_Neonet_Void_Gateway_Adapter {
 		);
 
 		if ( is_wp_error( $response ) ) {
-			$this->log( 'Direct VOID transport error', array( 'error' => $response->get_error_message() ) );
+			$this->log( 'Cybersource API transport error', array( 'action' => $action, 'error' => $response->get_error_message() ) );
 			return array(
 				'success' => false,
 				'code'    => 'void_transport_error',
@@ -219,12 +263,13 @@ class EpicPay_DLP_Neonet_Void_Gateway_Adapter {
 		$body_json     = json_decode( $response_body, true );
 
 		$this->log(
-			'Direct VOID response',
+			'Cybersource API response',
 			array(
-				'status_code' => $status_code,
-				'order_id'    => $order->get_id(),
+				'action'                => $action,
+				'status_code'           => $status_code,
+				'order_id'              => $order->get_id(),
 				'transaction_reference' => $transaction_reference,
-				'body'        => $body_json,
+				'body'                  => $body_json,
 			)
 		);
 
@@ -252,7 +297,14 @@ class EpicPay_DLP_Neonet_Void_Gateway_Adapter {
 		return array(
 			'success'               => false,
 			'code'                  => 'void_rejected',
-			'message'               => sprintf( __( 'Cybersource VOID failed (%1$s): %2$s', 'epicpay-dlp-neonet-void' ), (string) $status_code, $error_message ),
+			'http_status'           => $status_code,
+			'message'               => sprintf(
+				/* translators: 1: HTTP status, 2: error message */
+				__( 'Cybersource VOID/%1$s failed (%2$s): %3$s', 'epicpay-dlp-neonet-void' ),
+				strtoupper( $action ),
+				(string) $status_code,
+				$error_message
+			),
 			'transaction_reference' => $transaction_reference,
 		);
 	}
