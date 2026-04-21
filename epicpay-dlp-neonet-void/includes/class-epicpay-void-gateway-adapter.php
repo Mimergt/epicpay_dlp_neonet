@@ -391,20 +391,91 @@ class EpicPay_DLP_Neonet_Void_Gateway_Adapter {
 	/**
 	 * Attempt to read credentials from active gateway settings.
 	 *
-	 * @param WC_Payment_Gateway $gateway Gateway instance.
+	 * Reads both via the gateway object and directly from the wp_options table
+	 * (woocommerce_{id}_settings) so credentials are found regardless of
+	 * how the gateway was instantiated at runtime.
+	 *
+	 * @param WC_Payment_Gateway|null $gateway Gateway instance (may be null).
 	 * @return array
 	 */
 	private function extract_credentials_from_gateway( $gateway ) {
-		$merchant_id = $this->get_gateway_option( $gateway, array( 'merchant_id', 'merchantid', 'merchantId' ) );
-		$key_id      = $this->get_gateway_option( $gateway, array( 'api_key', 'api_key_id', 'api_key_detail', 'key_id', 'key' ) );
-		$secret      = $this->get_gateway_option( $gateway, array( 'api_shared_secret', 'api_shared_secret_key', 'shared_secret', 'sharedSecret' ) );
+		// Build a merged flat settings array from every available source.
+		$flat = array();
 
-		$environment = $this->infer_gateway_environment( $gateway );
+		// Source 1: raw WP option — most reliable, works even if gateway object
+		// is not fully initialised.
+		$gateway_ids_to_try = array();
+		if ( $gateway && ! empty( $gateway->id ) ) {
+			$gateway_ids_to_try[] = $gateway->id;
+		}
+		// Also try the gateway IDs listed in our plugin settings as fallback.
+		$configured_ids = array_filter( array_map( 'trim', explode( ',', (string) $this->settings->get( 'gateway_ids' ) ) ) );
+		foreach ( $configured_ids as $gid ) {
+			if ( ! in_array( $gid, $gateway_ids_to_try, true ) ) {
+				$gateway_ids_to_try[] = $gid;
+			}
+		}
+
+		foreach ( $gateway_ids_to_try as $gid ) {
+			$raw = get_option( 'woocommerce_' . $gid . '_settings', array() );
+			if ( is_array( $raw ) && ! empty( $raw ) ) {
+				$flat = array_merge( $raw, $flat ); // existing keys win
+				break; // stop at first match
+			}
+		}
+
+		// Source 2: gateway object settings array.
+		if ( $gateway && isset( $gateway->settings ) && is_array( $gateway->settings ) ) {
+			foreach ( $gateway->settings as $k => $v ) {
+				if ( ! isset( $flat[ $k ] ) ) {
+					$flat[ $k ] = $v;
+				}
+			}
+		}
+
+		// Source 3: gateway->get_option() for any keys not yet resolved.
+		// We do this only for our specific candidates to avoid excessive calls.
+		if ( $gateway && method_exists( $gateway, 'get_option' ) ) {
+			$all_candidates = array(
+				'merchant_id', 'merchantid', 'merchantId',
+				'api_key', 'api_key_id', 'key_id', 'key',
+				'api_shared_secret', 'api_shared_secret_key', 'shared_secret', 'sharedSecret',
+				'secret_key',
+				'environment', 'env', 'testmode', 'test_mode',
+			);
+			foreach ( $all_candidates as $c ) {
+				if ( ! isset( $flat[ $c ] ) ) {
+					$v = $gateway->get_option( $c );
+					if ( '' !== $v && null !== $v ) {
+						$flat[ $c ] = $v;
+					}
+				}
+			}
+		}
+
+		// Log all discovered setting keys (values masked) for diagnostics.
+		$masked = array();
+		foreach ( $flat as $k => $v ) {
+			$masked[ $k ] = ( strlen( (string) $v ) > 4 ) ? substr( $v, 0, 2 ) . '***' : ( empty( $v ) ? '(empty)' : '***' );
+		}
+		$this->log( 'Gateway settings keys discovered', array( 'keys' => $masked ) );
+
+		// Resolve each credential from the merged flat array.
+		$merchant_id = $this->pick_from_flat( $flat, array( 'merchant_id', 'merchantid', 'merchantId' ) );
+		$key_id      = $this->pick_from_flat( $flat, array( 'api_key_id', 'key_id', 'api_key', 'key' ) );
+		$secret      = $this->pick_from_flat( $flat, array( 'api_shared_secret_key', 'api_shared_secret', 'shared_secret', 'sharedSecret', 'secret_key' ) );
+		$environment = $this->infer_environment_from_flat( $flat );
 		if ( empty( $environment ) ) {
 			$environment = (string) $this->settings->get( 'cybersource_environment' );
 		}
 
 		if ( empty( $merchant_id ) || empty( $key_id ) || empty( $secret ) ) {
+			$this->log( 'Could not resolve credentials from gateway', array(
+				'merchant_id_found' => ! empty( $merchant_id ),
+				'key_id_found'      => ! empty( $key_id ),
+				'secret_found'      => ! empty( $secret ),
+				'all_keys'          => array_keys( $flat ),
+			) );
 			return array(
 				'error' => __( 'Could not read Cybersource credentials from the gateway settings.', 'epicpay-dlp-neonet-void' ),
 			);
@@ -419,9 +490,50 @@ class EpicPay_DLP_Neonet_Void_Gateway_Adapter {
 	}
 
 	/**
-	 * Get first non-empty gateway option among candidate keys.
+	 * Pick first non-empty value from a flat settings array using candidate keys.
 	 *
-	 * @param WC_Payment_Gateway $gateway Gateway instance.
+	 * @param array $flat       Flat settings array.
+	 * @param array $candidates Ordered list of keys to try.
+	 * @return string
+	 */
+	private function pick_from_flat( $flat, $candidates ) {
+		foreach ( $candidates as $key ) {
+			if ( isset( $flat[ $key ] ) && '' !== trim( (string) $flat[ $key ] ) ) {
+				return trim( (string) $flat[ $key ] );
+			}
+		}
+		return '';
+	}
+
+	/**
+	 * Infer environment from a flat settings array.
+	 *
+	 * @param array $flat Flat settings array.
+	 * @return string 'production'|'test'|''
+	 */
+	private function infer_environment_from_flat( $flat ) {
+		$environment = strtolower( $this->pick_from_flat( $flat, array( 'environment', 'env' ) ) );
+		$test_mode   = strtolower( $this->pick_from_flat( $flat, array( 'testmode', 'test_mode' ) ) );
+
+		if ( in_array( $environment, array( 'production', 'prod', 'live' ), true ) ) {
+			return 'production';
+		}
+		if ( in_array( $environment, array( 'test', 'sandbox' ), true ) ) {
+			return 'test';
+		}
+		if ( in_array( $test_mode, array( 'yes', 'true', '1' ), true ) ) {
+			return 'test';
+		}
+		if ( in_array( $test_mode, array( 'no', 'false', '0' ), true ) ) {
+			return 'production';
+		}
+		return '';
+	}
+
+	/**
+	 * Get first non-empty gateway option among candidate keys (legacy helper).
+	 *
+	 * @param WC_Payment_Gateway $gateway    Gateway instance.
 	 * @param array              $candidates Option key candidates.
 	 * @return string
 	 */
@@ -440,35 +552,6 @@ class EpicPay_DLP_Neonet_Void_Gateway_Adapter {
 			if ( ! empty( $value ) ) {
 				return trim( (string) $value );
 			}
-		}
-
-		return '';
-	}
-
-	/**
-	 * Infer gateway environment from known settings.
-	 *
-	 * @param WC_Payment_Gateway $gateway Gateway instance.
-	 * @return string
-	 */
-	private function infer_gateway_environment( $gateway ) {
-		$environment = strtolower( $this->get_gateway_option( $gateway, array( 'environment', 'env' ) ) );
-		$test_mode   = strtolower( $this->get_gateway_option( $gateway, array( 'testmode', 'test_mode' ) ) );
-
-		if ( in_array( $environment, array( 'production', 'prod', 'live' ), true ) ) {
-			return 'production';
-		}
-
-		if ( in_array( $environment, array( 'test', 'sandbox' ), true ) ) {
-			return 'test';
-		}
-
-		if ( in_array( $test_mode, array( 'yes', 'true', '1' ), true ) ) {
-			return 'test';
-		}
-
-		if ( in_array( $test_mode, array( 'no', 'false', '0' ), true ) ) {
-			return 'production';
 		}
 
 		return '';
