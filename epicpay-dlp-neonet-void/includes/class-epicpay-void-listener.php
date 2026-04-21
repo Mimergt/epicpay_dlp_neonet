@@ -8,6 +8,7 @@ class EpicPay_DLP_Neonet_Void_Listener {
 	const META_VOID_STATUS      = '_epicpay_void_status';
 	const META_VOID_ATTEMPTED_AT = '_epicpay_void_attempted_at';
 	const META_VOID_REFERENCE   = '_epicpay_void_reference';
+	const META_VOID_CODE        = '_epicpay_void_code';
 	const META_VOID_MESSAGE     = '_epicpay_void_message';
 
 	/**
@@ -68,14 +69,25 @@ class EpicPay_DLP_Neonet_Void_Listener {
 
 		$order->update_meta_data( self::META_VOID_ATTEMPTED_AT, gmdate( 'c' ) );
 		$order->update_meta_data( self::META_VOID_STATUS, ! empty( $result['success'] ) ? 'success' : 'failed' );
+		$order->update_meta_data( self::META_VOID_CODE, isset( $result['code'] ) ? sanitize_text_field( (string) $result['code'] ) : '' );
 		$order->update_meta_data( self::META_VOID_REFERENCE, isset( $result['transaction_reference'] ) ? wc_clean( (string) $result['transaction_reference'] ) : '' );
 		$order->update_meta_data( self::META_VOID_MESSAGE, isset( $result['message'] ) ? sanitize_text_field( (string) $result['message'] ) : '' );
 		$order->save();
 
 		if ( ! empty( $result['success'] ) ) {
-			$order->add_order_note(
-				__( 'EpicPay VOID: Payment reversal request accepted by gateway.', 'epicpay-dlp-neonet-void' )
-			);
+			if ( isset( $result['code'] ) && 'void_approved' === $result['code'] ) {
+				$order->add_order_note(
+					__( 'EpicPay VOID: Cybersource VOID approved.', 'epicpay-dlp-neonet-void' )
+				);
+			} elseif ( isset( $result['code'] ) && 'fallback_accepted' === $result['code'] ) {
+				$order->add_order_note(
+					__( 'EpicPay VOID warning: direct VOID failed and refund fallback was accepted.', 'epicpay-dlp-neonet-void' )
+				);
+			} else {
+				$order->add_order_note(
+					__( 'EpicPay VOID: Payment reversal request accepted by gateway.', 'epicpay-dlp-neonet-void' )
+				);
+			}
 			return;
 		}
 

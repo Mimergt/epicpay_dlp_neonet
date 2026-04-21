@@ -3,11 +3,13 @@
 Plugin independiente para WooCommerce que intenta anular (VOID) la transaccion al cancelar un pedido, sin modificar el plugin oficial de Cybersource.
 
 ## Estado
-Version inicial de Paso 1 (base funcional):
+Version 0.2.0:
 - Escucha cancelaciones de pedidos.
 - Evalua elegibilidad por metodo de pago.
 - Busca referencias de transaccion en transaction_id y metadatos configurables.
-- Intenta reversal via gateway usando la capa estandar del gateway (`process_refund`), que en gateways SkyVerge/Cybersource realiza VOID cuando la transaccion aun es anulable.
+- Intenta VOID directo via Cybersource REST API (`/pts/v2/payments/{id}/reversals`) con firma HTTP.
+- Soporta tomar credenciales desde el gateway de Cybersource o de forma manual.
+- Mantiene fallback opcional a flujo refund del gateway (apagado por defecto).
 - Guarda trazabilidad en metadatos y notas del pedido.
 
 ## Instalacion
@@ -19,15 +21,20 @@ Version inicial de Paso 1 (base funcional):
    - Allowed payment method IDs
    - Transaction meta keys
    - Request ID meta keys
+   - Use CyberSource gateway credentials
+   - Cybersource environment
+   - (Opcional) credenciales manuales
+   - Allow refund fallback (recomendado apagado)
 
 ## Metadatos usados por el plugin
 - `_epicpay_void_status` (`success`, `failed`, `skipped`)
 - `_epicpay_void_attempted_at` (ISO-8601 UTC)
+- `_epicpay_void_code`
 - `_epicpay_void_reference`
 - `_epicpay_void_message`
 
 ## Nota tecnica importante
-Para mantener independencia del plugin oficial, esta version usa el gateway activo del pedido y llama `process_refund()` para delegar al comportamiento nativo (VOID o refund segun elegibilidad/settlement).
+El flujo principal de esta version es VOID directo por API REST de Cybersource. El fallback a refund se ejecuta solo si se habilita explicitamente en configuracion.
 
 Si necesitas forzar un flujo REST de VOID 100% directo, puedes extender con el filtro:
 - `epicpay_dlp_neonet_void_custom_attempt`

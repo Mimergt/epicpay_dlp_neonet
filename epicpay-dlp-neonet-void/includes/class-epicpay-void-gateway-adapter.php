@@ -18,7 +18,7 @@ class EpicPay_DLP_Neonet_Void_Gateway_Adapter {
 	}
 
 	/**
-	 * Attempts to void an order's transaction.
+	 * Attempts to void an order's transaction using Cybersource direct REST API.
 	 *
 	 * @param WC_Order $order WooCommerce order.
 	 * @return array
@@ -50,45 +50,23 @@ class EpicPay_DLP_Neonet_Void_Gateway_Adapter {
 			return $custom;
 		}
 
-		if ( ! method_exists( $gateway, 'process_refund' ) ) {
-			return array(
-				'success' => false,
-				'code'    => 'refund_method_missing',
-				'message' => __( 'Gateway does not expose process_refund() to trigger void/refund handling.', 'epicpay-dlp-neonet-void' ),
-			);
+		$void_result = $this->request_direct_void( $order, $gateway, $transaction_reference );
+
+		if ( ! empty( $void_result['success'] ) ) {
+			return $void_result;
 		}
 
-		$reason = sprintf(
-			/* translators: %s: Order number */
-			__( 'Auto-void on cancellation for order %s', 'epicpay-dlp-neonet-void' ),
-			$order->get_order_number()
-		);
-
-		$result = $gateway->process_refund( $order->get_id(), $order->get_total(), $reason );
-
-		if ( is_wp_error( $result ) ) {
-			return array(
-				'success' => false,
-				'code'    => 'gateway_error',
-				'message' => $result->get_error_message(),
-				'errors'  => $result->get_error_messages(),
-			);
+		if ( ! $this->settings->allow_refund_fallback() ) {
+			return $void_result;
 		}
 
-		if ( true !== $result ) {
-			return array(
-				'success' => false,
-				'code'    => 'gateway_rejected',
-				'message' => __( 'Gateway rejected the VOID/refund attempt.', 'epicpay-dlp-neonet-void' ),
-			);
+		$fallback_result = $this->attempt_refund_fallback( $order, $gateway, $transaction_reference );
+
+		if ( ! empty( $fallback_result['success'] ) ) {
+			return $fallback_result;
 		}
 
-		return array(
-			'success'              => true,
-			'code'                 => 'request_accepted',
-			'message'              => __( 'Gateway accepted cancellation payment reversal request (void/refund per gateway eligibility).', 'epicpay-dlp-neonet-void' ),
-			'transaction_reference' => $transaction_reference,
-		);
+		return $void_result;
 	}
 
 	/**
@@ -140,5 +118,323 @@ class EpicPay_DLP_Neonet_Void_Gateway_Adapter {
 		}
 
 		return '';
+	}
+
+	/**
+	 * Attempt a direct Cybersource VOID request.
+	 *
+	 * @param WC_Order           $order WooCommerce order.
+	 * @param WC_Payment_Gateway $gateway Payment gateway instance.
+	 * @param string             $transaction_reference Cybersource transaction ID/reference.
+	 * @return array
+	 */
+	private function request_direct_void( WC_Order $order, $gateway, $transaction_reference ) {
+		$credentials = $this->resolve_cybersource_credentials( $gateway );
+
+		if ( ! empty( $credentials['error'] ) ) {
+			return array(
+				'success' => false,
+				'code'    => 'missing_credentials',
+				'message' => $credentials['error'],
+			);
+		}
+
+		$payload = array(
+			'clientReferenceInformation' => array(
+				'code' => (string) $order->get_order_number(),
+			),
+			'reversalInformation' => array(
+				'amountDetails' => array(
+					'totalAmount' => wc_format_decimal( $order->get_total(), wc_get_price_decimals() ),
+					'currency'    => (string) $order->get_currency(),
+				),
+			),
+		);
+
+		$payload_json = wp_json_encode( $payload );
+		if ( false === $payload_json ) {
+			return array(
+				'success' => false,
+				'code'    => 'payload_encoding_failed',
+				'message' => __( 'Failed to encode VOID payload.', 'epicpay-dlp-neonet-void' ),
+			);
+		}
+
+		$host = 'production' === $credentials['environment'] ? 'api.cybersource.com' : 'apitest.cybersource.com';
+		$path = '/pts/v2/payments/' . rawurlencode( $transaction_reference ) . '/reversals';
+		$url  = 'https://' . $host . $path;
+
+		$date_header   = gmdate( 'D, d M Y H:i:s \G\M\T' );
+		$digest_header = 'SHA-256=' . base64_encode( hash( 'sha256', $payload_json, true ) );
+
+		$signature_headers = 'host date (request-target) digest v-c-merchant-id';
+		$signature_payload =
+			'host: ' . $host . "\n" .
+			'date: ' . $date_header . "\n" .
+			'(request-target): post ' . $path . "\n" .
+			'digest: ' . $digest_header . "\n" .
+			'v-c-merchant-id: ' . $credentials['merchant_id'];
+
+		$hmac = hash_hmac( 'sha256', $signature_payload, base64_decode( $credentials['shared_secret'], true ), true );
+		if ( false === $hmac ) {
+			$hmac = hash_hmac( 'sha256', $signature_payload, $credentials['shared_secret'], true );
+		}
+
+		$signature = base64_encode( $hmac );
+		$signature_header = sprintf(
+			'keyid="%s", algorithm="HmacSHA256", headers="%s", signature="%s"',
+			$credentials['key_id'],
+			$signature_headers,
+			$signature
+		);
+
+		$response = wp_remote_post(
+			$url,
+			array(
+				'timeout' => 45,
+				'headers' => array(
+					'Accept'          => 'application/hal+json;charset=utf-8',
+					'Content-Type'    => 'application/json;charset=utf-8',
+					'v-c-merchant-id' => $credentials['merchant_id'],
+					'Date'            => $date_header,
+					'Host'            => $host,
+					'Digest'          => $digest_header,
+					'Signature'       => $signature_header,
+				),
+				'body'    => $payload_json,
+			)
+		);
+
+		if ( is_wp_error( $response ) ) {
+			$this->log( 'Direct VOID transport error', array( 'error' => $response->get_error_message() ) );
+			return array(
+				'success' => false,
+				'code'    => 'void_transport_error',
+				'message' => $response->get_error_message(),
+			);
+		}
+
+		$status_code   = (int) wp_remote_retrieve_response_code( $response );
+		$response_body = (string) wp_remote_retrieve_body( $response );
+		$body_json     = json_decode( $response_body, true );
+
+		$this->log(
+			'Direct VOID response',
+			array(
+				'status_code' => $status_code,
+				'order_id'    => $order->get_id(),
+				'transaction_reference' => $transaction_reference,
+				'body'        => $body_json,
+			)
+		);
+
+		if ( $status_code >= 200 && $status_code < 300 ) {
+			$new_reference = isset( $body_json['id'] ) ? (string) $body_json['id'] : $transaction_reference;
+
+			return array(
+				'success'               => true,
+				'code'                  => 'void_approved',
+				'message'               => __( 'Cybersource VOID approved.', 'epicpay-dlp-neonet-void' ),
+				'transaction_reference' => $new_reference,
+				'void_reference'        => $new_reference,
+			);
+		}
+
+		$error_message = __( 'Cybersource VOID rejected.', 'epicpay-dlp-neonet-void' );
+		if ( is_array( $body_json ) ) {
+			if ( ! empty( $body_json['message'] ) ) {
+				$error_message = sanitize_text_field( (string) $body_json['message'] );
+			} elseif ( ! empty( $body_json['details'] ) ) {
+				$error_message = sanitize_text_field( wp_json_encode( $body_json['details'] ) );
+			}
+		}
+
+		return array(
+			'success'               => false,
+			'code'                  => 'void_rejected',
+			'message'               => sprintf( __( 'Cybersource VOID failed (%1$s): %2$s', 'epicpay-dlp-neonet-void' ), (string) $status_code, $error_message ),
+			'transaction_reference' => $transaction_reference,
+		);
+	}
+
+	/**
+	 * Optional fallback using process_refund.
+	 *
+	 * @param WC_Order           $order WooCommerce order.
+	 * @param WC_Payment_Gateway $gateway Gateway instance.
+	 * @param string             $transaction_reference Reference string.
+	 * @return array
+	 */
+	private function attempt_refund_fallback( WC_Order $order, $gateway, $transaction_reference ) {
+		if ( ! method_exists( $gateway, 'process_refund' ) ) {
+			return array(
+				'success' => false,
+				'code'    => 'refund_method_missing',
+				'message' => __( 'Gateway does not expose process_refund() for fallback.', 'epicpay-dlp-neonet-void' ),
+			);
+		}
+
+		$reason = sprintf(
+			/* translators: %s: Order number */
+			__( 'Fallback reversal after VOID failure for order %s', 'epicpay-dlp-neonet-void' ),
+			$order->get_order_number()
+		);
+
+		$result = $gateway->process_refund( $order->get_id(), $order->get_total(), $reason );
+
+		if ( is_wp_error( $result ) ) {
+			return array(
+				'success' => false,
+				'code'    => 'fallback_gateway_error',
+				'message' => $result->get_error_message(),
+			);
+		}
+
+		if ( true !== $result ) {
+			return array(
+				'success' => false,
+				'code'    => 'fallback_rejected',
+				'message' => __( 'Fallback gateway reversal rejected.', 'epicpay-dlp-neonet-void' ),
+			);
+		}
+
+		return array(
+			'success'               => true,
+			'code'                  => 'fallback_accepted',
+			'message'               => __( 'Fallback gateway reversal accepted after direct VOID failure.', 'epicpay-dlp-neonet-void' ),
+			'transaction_reference' => $transaction_reference,
+		);
+	}
+
+	/**
+	 * Resolve Cybersource credentials from gateway settings or manual plugin settings.
+	 *
+	 * @param WC_Payment_Gateway $gateway Gateway instance.
+	 * @return array
+	 */
+	private function resolve_cybersource_credentials( $gateway ) {
+		if ( 'yes' === $this->settings->get( 'use_gateway_credentials' ) ) {
+			$from_gateway = $this->extract_credentials_from_gateway( $gateway );
+			if ( empty( $from_gateway['error'] ) ) {
+				return $from_gateway;
+			}
+		}
+
+		$manual = array(
+			'merchant_id'  => trim( (string) $this->settings->get( 'cybersource_merchant_id' ) ),
+			'key_id'       => trim( (string) $this->settings->get( 'cybersource_api_key_id' ) ),
+			'shared_secret'=> trim( (string) $this->settings->get( 'cybersource_api_shared_secret' ) ),
+			'environment'  => (string) $this->settings->get( 'cybersource_environment' ),
+		);
+
+		if ( empty( $manual['merchant_id'] ) || empty( $manual['key_id'] ) || empty( $manual['shared_secret'] ) ) {
+			return array(
+				'error' => __( 'Cybersource credentials are missing. Enable gateway credentials or set manual credentials in EpicPay VOID settings.', 'epicpay-dlp-neonet-void' ),
+			);
+		}
+
+		return $manual;
+	}
+
+	/**
+	 * Attempt to read credentials from active gateway settings.
+	 *
+	 * @param WC_Payment_Gateway $gateway Gateway instance.
+	 * @return array
+	 */
+	private function extract_credentials_from_gateway( $gateway ) {
+		$merchant_id = $this->get_gateway_option( $gateway, array( 'merchant_id', 'merchantid', 'merchantId' ) );
+		$key_id      = $this->get_gateway_option( $gateway, array( 'api_key', 'api_key_id', 'api_key_detail', 'key_id', 'key' ) );
+		$secret      = $this->get_gateway_option( $gateway, array( 'api_shared_secret', 'api_shared_secret_key', 'shared_secret', 'sharedSecret' ) );
+
+		$environment = $this->infer_gateway_environment( $gateway );
+		if ( empty( $environment ) ) {
+			$environment = (string) $this->settings->get( 'cybersource_environment' );
+		}
+
+		if ( empty( $merchant_id ) || empty( $key_id ) || empty( $secret ) ) {
+			return array(
+				'error' => __( 'Could not read Cybersource credentials from the gateway settings.', 'epicpay-dlp-neonet-void' ),
+			);
+		}
+
+		return array(
+			'merchant_id'   => $merchant_id,
+			'key_id'        => $key_id,
+			'shared_secret' => $secret,
+			'environment'   => 'production' === $environment ? 'production' : 'test',
+		);
+	}
+
+	/**
+	 * Get first non-empty gateway option among candidate keys.
+	 *
+	 * @param WC_Payment_Gateway $gateway Gateway instance.
+	 * @param array              $candidates Option key candidates.
+	 * @return string
+	 */
+	private function get_gateway_option( $gateway, $candidates ) {
+		foreach ( $candidates as $candidate ) {
+			$value = '';
+
+			if ( method_exists( $gateway, 'get_option' ) ) {
+				$value = $gateway->get_option( $candidate );
+			}
+
+			if ( empty( $value ) && isset( $gateway->settings ) && is_array( $gateway->settings ) && isset( $gateway->settings[ $candidate ] ) ) {
+				$value = $gateway->settings[ $candidate ];
+			}
+
+			if ( ! empty( $value ) ) {
+				return trim( (string) $value );
+			}
+		}
+
+		return '';
+	}
+
+	/**
+	 * Infer gateway environment from known settings.
+	 *
+	 * @param WC_Payment_Gateway $gateway Gateway instance.
+	 * @return string
+	 */
+	private function infer_gateway_environment( $gateway ) {
+		$environment = strtolower( $this->get_gateway_option( $gateway, array( 'environment', 'env' ) ) );
+		$test_mode   = strtolower( $this->get_gateway_option( $gateway, array( 'testmode', 'test_mode' ) ) );
+
+		if ( in_array( $environment, array( 'production', 'prod', 'live' ), true ) ) {
+			return 'production';
+		}
+
+		if ( in_array( $environment, array( 'test', 'sandbox' ), true ) ) {
+			return 'test';
+		}
+
+		if ( in_array( $test_mode, array( 'yes', 'true', '1' ), true ) ) {
+			return 'test';
+		}
+
+		if ( in_array( $test_mode, array( 'no', 'false', '0' ), true ) ) {
+			return 'production';
+		}
+
+		return '';
+	}
+
+	/**
+	 * Log message with plugin source.
+	 *
+	 * @param string $message Message text.
+	 * @param array  $context Context payload.
+	 * @return void
+	 */
+	private function log( $message, $context = array() ) {
+		if ( ! function_exists( 'wc_get_logger' ) ) {
+			return;
+		}
+
+		$logger = wc_get_logger();
+		$logger->info( $message, array( 'source' => 'epicpay-dlp-neonet-void', 'context' => $context ) );
 	}
 }
